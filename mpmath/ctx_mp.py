@@ -3,7 +3,9 @@ This module defines the mpf, mpc classes, and standard functions for
 operating with them.
 """
 
+import cmath
 import functools
+import math
 import re
 import sys
 
@@ -705,11 +707,15 @@ maxterms, or set zeroprec."""
         # the sum and added accurately
         magnitude_check = {}
         max_total_jump = 0
+        nint = []
+        regrowth = None
         for i, c in enumerate(coeffs):
             if flags[i] == 'Z':
+                nint.append(c)
                 continue
             n, d = ctx.nint_distance(c)
             n = -int(n)
+            nint.append(-n)
             d = -d
             if i >= p and n >= 0 and d > 4:
                 if n in magnitude_check:
@@ -717,7 +723,11 @@ maxterms, or set zeroprec."""
                 else:
                     magnitude_check[n] = d
                 extraprec = max(extraprec, d - prec + 60)
+            if i >= p and n > 0:
+                regrowth = True
             max_total_jump += abs(d)
+        if regrowth:
+            regrowth = ctx._hypsum_regrowth(p, flags, coeffs, z, nint)
         while True:
             if extraprec > maxprec:
                 raise ctx.NoConvergence(ctx._hypsum_msg % (prec, prec+extraprec))
@@ -729,6 +739,29 @@ maxterms, or set zeroprec."""
             zv, have_complex, magnitude = summator(coeffs, v, prec, rounding,
                                                    wp, epsshift, mag_dict,
                                                    **kwargs)
+            if regrowth:
+                # Terms that became small and then grew back to a size
+                # that matters have ended the summation, or have lost
+                # their accuracy, while small. Sum them as a separate
+                # series instead.
+                split = libmp.libhyper.hyp_regrowth(*regrowth, magnitude,
+                                                   prec, wp, epsshift)
+                if split:
+                    head_dict = dict((n,None) for n in magnitude_check
+                                     if n < split[0])
+                    try:
+                        zv, have_complex, magnitude = ctx._hypsum_split(
+                            summator, p, q, flags, coeffs, z, v, split, wp,
+                            epsshift, head_dict, kwargs)
+                        mag_dict = head_dict
+                    except ctx.NoConvergence:
+                        if 'maxterms' in kwargs:
+                            raise
+                        # With complex parameters, rounding errors of the
+                        # fixed-point terms can keep the separate series
+                        # from ending. Fall back to the sum computed above
+                        # and do not try the split again at higher precision.
+                        regrowth = None
             cancel = -magnitude
             jumps_resolved = True
             if extraprec < max_total_jump:
@@ -762,7 +795,97 @@ maxterms, or set zeroprec."""
             else:
                 return ctx.make_mpf(zv)
         else:
-            return zv
+            return +zv
+
+    def _hypsum_regrowth(ctx, p, flags, coeffs, z, nint):
+        # When a denominator parameter b with negative real part changes
+        # sign at index n = -b, nearby terms have ratio about C/(m-n) with
+        # C = |z|*prod|a+n| / ((n+1)*prod|b'+n|) taken over the other
+        # parameters. Small terms can only grow back by many bits if C is
+        # large. In that case, return the parameters in the double
+        # precision form used by hyp_regrowth(); otherwise None.
+        try:
+            if hasattr(z, '_mpc_'):
+                z = complex(z)
+            else:
+                z = float(z)
+            if not 0 < abs(z) < math.inf:
+                return
+            for j in range(p, len(nint)):
+                n = -nint[j]
+                if n <= 0 or flags[j] == 'Z':
+                    continue
+                C = abs(z)/(n+1)
+                for i, k in enumerate(nint):
+                    # |re(x)+n| is within 1/2 of |k+n|
+                    if i < p:
+                        t = abs(k+n) + 0.5
+                        if flags[i] == 'C':
+                            t += abs(float(coeffs[i].imag))
+                        C *= t
+                    elif i != j:
+                        C /= max(abs(k+n) - 0.5, 0.001)
+                if C > 4:
+                    break
+            else:
+                return
+            params = []
+            for c, n in zip(coeffs, nint):
+                w = c - n
+                if hasattr(w, '_mpc_'):
+                    w = complex(w)
+                else:
+                    w = float(w)
+                # Double precision cannot resolve the terms for larger
+                # parameters
+                if abs(n) + abs(w) >= 2**45:
+                    return
+                params.append((n, w))
+            return (params[:p], params[p:], math.log(abs(z)),
+                    cmath.phase(z))
+        except (OverflowError, ValueError):
+            return
+
+    def _hypsum_split(ctx, summator, p, q, flags, coeffs, z, v, split, wp,
+                      epsshift, mag_dict, kwargs):
+        # Sum the terms with index < m, then add term m times a series
+        # with shifted parameters that gives the remaining terms. That
+        # series starts at its smallest term, so its fixed-point terms
+        # keep their accuracy.
+        m, nterms = split
+        zv, have_complex, magnitude = summator(coeffs, v, wp, 'n', wp,
+                                               epsshift, mag_dict, m,
+                                               **kwargs)
+        if 'maxterms' not in kwargs:
+            # The default limit does not account for the regrown terms
+            kwargs = dict(kwargs, maxterms=max(100*wp, 2*(nterms-m)))
+        prec = ctx.prec
+        try:
+            ctx.prec = wp
+            if have_complex:
+                s = ctx.make_mpc(zv)
+            else:
+                s = ctx.make_mpf(zv)
+            t = z**m / ctx.fac(m)
+            shifted = []
+            for i, c in enumerate(coeffs):
+                r = ctx.rf(c, m)
+                if i < p:
+                    t *= r
+                else:
+                    t /= r
+                if flags[i] in 'ZQ':
+                    shifted.append(c + m)
+                else:
+                    shifted.append(ctx.fadd(c, m, exact=True))
+            flags = tuple(flags[:p]) + ('Z',) + tuple(flags[p:]) + ('Z',)
+            shifted = shifted[:p] + [1] + shifted[p:] + [m+1]
+            s += t * ctx.hypsum(p+1, q+1, flags, shifted, z, **kwargs)
+        finally:
+            ctx.prec = prec
+        if s:
+            return s, have_complex, ctx.mag(s)
+        return s, have_complex, -wp+1
 
     def ldexp(ctx, x, n):
         r"""

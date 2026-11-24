@@ -218,6 +218,85 @@ def test_hyper_misc():
     pytest.raises(ZeroDivisionError, lambda: mp.hyper([1, 2, -2], [-1, 3], 1.1))
     pytest.raises(ZeroDivisionError, lambda: fp.hyper([1, 2, -2], [-1, 3], 1.1))
 
+def test_issue_1216():
+    # Reference values in this and the following two tests are sums of
+    # the series computed term by term in floating-point arithmetic,
+    # with 2500 and with 5000 digits.
+    with mp.workdps(100):
+        a, b, c, z = mpf('5.9'), mpf('-26.4'), mpf('-570.5'), mpf('0.66')
+        zr, zc = mpc(z), mpc('0.66', '0.001')
+        v = mpf('4.47842706988641822692379428938202989705432413916358387257'
+                '47809825205523443167495e+120')
+        vc = mpc('-2.3187604438914607046137784044334528196774736816158088413'
+                 '759370170742246198491712e+120',
+                 '2.45767473456060499233507007182091709830551561769759472283'
+                 '01542429031719271600242e+120')
+    for dps in [15, 30, 65]:
+        with mp.workdps(dps):
+            assert hyp2f1(a, b, c, z).ae(v)
+            assert hyp2f1(a, b, c, zr).ae(v)
+            assert hyp2f1((59, 10), (-132, 5), (-1141, 2), z).ae(v)
+            assert hyp2f1(a, b, c+0.25j, zc).ae(vc)
+    assert hyp2f1(5.9, -26.4, -570.5, 0.66).ae(4.4784270698867926e+120)
+    # The terms grow back after 571 terms and get small after about 3000
+    pytest.raises(NoConvergence, lambda: hyp2f1(a, b, c, z, maxterms=500,
+                                                force_series=True))
+
+def test_issue_1220():
+    with mp.workdps(220):
+        v = mpf('-8.07073042909916798429103959109415988977629667305520473224'
+                '960082837625616016130661878632945373584738195532475511762315'
+                '110296880321460987963660882261763591672533149306499630181479'
+                '93872593132490308084369829638621624962e-26')
+        vc = mpc('-5.1109973761921867074948907984266884313448267970061941980'
+                 '44974458404903722724355e-26',
+                 '-3.3174845981429660616387792805535710748196382233023099872'
+                 '534655790721318888888083e-26')
+        vi = mpf('1547635716.48087947888875937595323713184254559425895375273'
+                 '71804672776155318522894')
+    # At 200 digits, the summation does not end at the small terms
+    # but they lose most of their bits
+    for dps in [15, 30, 65, 200]:
+        with mp.workdps(dps):
+            assert hyp0f1(-1000.5, 115000).ae(v)
+            assert hyp0f1(-1000.5, 115000, force_series=True).ae(v)
+    for dps in [15, 30, 65]:
+        with mp.workdps(dps):
+            assert hyp0f1(-1000.5+0.25j, 115000+1j).ae(vc)
+            assert besseli(-1001.5, 678).ae(vi)
+
+def test_hypsum_regrowth():
+    # Terms that become small and grow back after a denominator
+    # parameter changes sign, see issues 1216 and 1220
+    for dps in [15, 30]:
+        with mp.workdps(dps):
+            # Two negative denominator parameters
+            assert hyper([mpf(2787)/64, mpf(135)/64, mpf(255)/64],
+                         [mpf(-53)/16, mpf(-26455)/64], mpf(663)/1024).ae(
+                mpf('2.6968000793652444412733635532110311711644e+217'))
+            assert hyp2f2(mpf(-2999)/16, mpf(79)/64, mpf(-2273)/2,
+                          mpf(-93)/32, mpf(89047)/64).ae(
+                mpf('1.3966419455017420386059502474691480742412e+923'))
+            # The smallest term is about 2**-1084
+            assert hyp2f1(mpf(49)/32, mpf(63)/64, mpf(-59563)/64,
+                          mpf(813)/1024).ae(
+                mpf('-8.5644177542116724987817654821529488053941e+551'))
+    # Nothing grows back to a relevant size here. The limits on the
+    # number of terms verify that the series is summed as before.
+    for dps in [15, 30]:
+        with mp.workdps(dps):
+            # Terms of alternating sign grow back to about 2**495, but cancel
+            assert hyp2f1(2, mpf(27)/64, mpf(-43385)/32, mpf(-575)/1024,
+                          maxterms=100, force_series=True).ae(
+                mpf('1.0003497649696890526894510982561961066908'))
+            assert hyp0f1(-49999.5, 0.5, maxterms=50, force_series=True).ae(
+                mpf('0.99998999995000083337375099917804251475206'))
+            assert hyp2f1(1.5, 2.5, -3000.5, mpf(2)/5, maxterms=50,
+                          force_series=True).ae(
+                mpf('0.99950037478202122216364922712696837503514'))
+            assert besselj(-1000.5, 1).ae(
+                mpf('6.1384589002622789175687393515553649134747e+2866'))
+
 def test_elliptic_integrals():
     assert ellipk(0).ae(pi/2)
     assert ellipk(0.5).ae(gamma(0.25)**2/(4*sqrt(pi)))
