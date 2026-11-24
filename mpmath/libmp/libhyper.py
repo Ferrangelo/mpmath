@@ -149,7 +149,7 @@ def make_hyp_summator(key):
     noncancellable_real_den = breal[cancellable_real:]
 
     # LOOP
-    add("for n in range(1,10**8):")
+    add("for n in range(1,nterms):")
 
     add("    if n in magnitude_check:")
     add("        p_mag = PRE.bit_length()")
@@ -281,8 +281,8 @@ def make_hyp_summator(key):
         add("return a, False, magn")
 
     source = "\n".join(("    " + line) for line in source)
-    source = (f"def {fname}(coeffs, z, prec, rnd, "
-              "wp, epsshift, magnitude_check, **kwargs):\n") + source
+    source = (f"def {fname}(coeffs, z, prec, rnd, wp, epsshift, "
+              "magnitude_check, nterms=10**8, **kwargs):\n") + source
 
     namespace = {}
 
