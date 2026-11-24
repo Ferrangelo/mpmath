@@ -5,6 +5,7 @@ of hypergeometric series. Optimized versions for various special
 cases are also provided.
 """
 
+import cmath
 import math
 
 from .backend import MPZ, MPZ_ONE, MPZ_ZERO
@@ -290,6 +291,148 @@ def make_hyp_summator(key):
 
     #print source
     return source, namespace[fname]
+
+
+def _lgamma_abs(u):
+    """log|gamma(u)| for a float or complex u with re(u) >= 0.5."""
+    if type(u) is float:
+        return math.lgamma(u)
+    r = 0.0
+    while u.real < 10:
+        r -= math.log(abs(u))
+        u += 1
+    return r + ((u-0.5)*cmath.log(u) - u + 1/(12*u)).real + 0.9189385332046727
+
+def _log_rf(x, m):
+    """
+    log|x(x+1)...(x+m-1)| where x = n + w is given as the pair (n, w),
+    n being the integer nearest to re(x). Splitting the product at the
+    factor w nearest to zero avoids the poles of the gamma function.
+    """
+    n, w = x
+    if n > 0:
+        return _lgamma_abs(n+m+w) - _lgamma_abs(n+w)
+    k = min(m, -n)
+    v = _lgamma_abs(1-n-w) - _lgamma_abs(1-n-k-w)
+    if m > -n:
+        if not w:
+            return -math.inf
+        v += math.log(abs(w)) + _lgamma_abs(m+n+w) - _lgamma_abs(1+w)
+    return v
+
+def hyp_regrowth(a_s, b_s, zlog, zarg, mag, prec, wp, epsshift):
+    """
+    Locate terms of a hypergeometric series that become small and then
+    grow back to a sum that matters, after the series was summed in
+    fixed point with wp bits to a result of magnitude mag. This can
+    happen when a parameter with negative real part changes sign.
+    The fixed-point summation ends at the small terms, or continues
+    with terms that have lost their leading bits.
+
+    The parameters are given as pairs (n, w) = (nearest integer, x - n),
+    with zlog = log|z| and zarg = arg(z). Term magnitudes are estimated
+    in double precision from the closed form of the terms, as base 2
+    logarithms relative to the first term.
+
+    Returns (m, n) where the term with index m is the smallest one
+    preceding the first such group of terms, and all terms from index n
+    on are negligible; returns None if there is no such group.
+    """
+    p, q = len(a_s), len(b_s)
+    last = min((-n for n, w in a_s if n <= 0 and not w), default=1 << 45)
+    if last == 1 << 45 and (p > q+1 or (p == q+1 and zlog >= 0)):
+        return
+    params = a_s + b_s
+    log, lgamma, ln2, pi = math.log, math.lgamma, math.log(2), math.pi
+    # A group of terms is negligible below 2**thr. Smaller terms end the
+    # summation below 2**-stop, and have lost more than the spare guard
+    # bits below 2**-spare.
+    thr = max(epsshift-wp, mag-prec-10)
+    stop = wp-epsshift-2
+    spare = wp-prec-10
+
+    def ratio(m):
+        # log|t(m+1)/t(m)|
+        v = zlog - log(m+1)
+        for n, w in a_s:
+            t = abs(n+m+w)
+            if not t:
+                return -math.inf
+            v += log(t)
+        for n, w in b_s:
+            t = abs(n+m+w)
+            if not t:
+                return math.inf
+            v -= log(t)
+        return v
+
+    def size(m):
+        # log2|t(m)|
+        v = m*zlog - lgamma(m+1)
+        for x in a_s:
+            v += _log_rf(x, m)
+        for x in b_s:
+            v -= _log_rf(x, m)
+        return v/ln2
+
+    def search(m, d, bound):
+        # Given ratio(m) > 0, follow the run of growing terms in the
+        # direction d = +-1 up to (excluding) bound; return its last index
+        step = d
+        while (bound-m-step)*d > 0 and ratio(m+step) > 0:
+            m += step
+            step *= 2
+        hi = m+step if (bound-m-step)*d > 0 else bound
+        while abs(hi-m) > 1:
+            mid = (m+hi)//2
+            if ratio(mid) > 0:
+                m = mid
+            else:
+                hi = mid
+        return m
+
+    low, m = 0.0, 0
+    peak = 0
+    cross = sorted(-n for n, w in params if n < 0)
+    for i, c in enumerate(cross):
+        # The factor x+c is smallest at index c; do the terms grow there?
+        if c < peak or c >= last:
+            continue
+        if ratio(c) <= 0:
+            c += 1
+            if c >= last or ratio(c) <= 0:
+                continue
+        # Smallest term so far: the one at the start of this run of growth
+        start = search(c, -1, peak-1)
+        if start:
+            low, m = min((low, m), (size(start), start))
+        accurate = -low <= min(spare, stop)
+        if accurate and i == len(cross)-1:
+            break
+        peak = search(c, 1, last) + 1
+        if accurate:
+            continue
+        # The terms around the largest one, t(peak), add up to about
+        # t(peak)*sqrt(2*pi/k)*exp(-u**2/(2*k)) where consecutive terms
+        # differ in phase by u and exp(-k) is the rate at which their
+        # ratio decreases. In particular, terms of alternating sign
+        # (u = pi) cancel unless the peak is very narrow.
+        u = zarg
+        for j, (n, w) in enumerate(params):
+            v = cmath.phase(n+peak-1+w)
+            u += v if j < p else -v
+        u = math.remainder(u, 2*pi)
+        k = min(max(ratio(peak-1) - ratio(peak), 1e-300), 2*pi)
+        top = size(peak) + (log(2*pi/k)/2 - u*u/(2*k))/ln2
+        if top < thr:
+            continue
+        if -low <= stop and top - low - max(mag, top) <= spare:
+            continue
+        end = step = peak
+        while end < last and size(end) >= thr:
+            end += step
+            step *= 2
+        return m, min(end, last+1)
 
 
 #-----------------------------------------------------------------------#
